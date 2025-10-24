@@ -1,0 +1,100 @@
+email:
+  enabled: true
+  only_journals: false            # 仅顶刊；若 true 可配合 include_conferences
+  include_conferences: true       # 在仅顶刊基础上并入顶会
+  attach_digest: true             # 附当日 md 摘要
+  min_count: 1                    # 少于该数量则不发（并在日志中提示跳过原因）
+  subject_tpl: "PaperRadar · {date} · {count} 篇"
+  body_format: "html"             # 或 "text"
+  to: ["your@domain.com"]
+  from: "sender@domain.com"
+  smtp:
+    host: "smtp.qq.com"           # QQ: smtp.qq.com / 465(SSL) 或 587(STARTTLS)
+    port: 465
+    ssl: true
+    starttls: false
+    username: "sender@domain.com"
+    password: "邮箱应用专用密码"
+output_dir: ./digests
+cache_path: ./cache.json
+since_days: 5
+max_per_query: 80
+target_total: 5
+per_category_max: 3
+summary_sentences: 3
+min_daily: 5
+fallback_days: 21
+notify:
+  desktop: false
+  open_file: false
+priority:
+  prefer_top_venues: true
+  allow_repeat_fill: true
+  repeat_lookback_days: 7
+  repeat_label: （重复推荐：首次推送 {date}）
+sources:
+  arxiv: true
+  openalex_conferences: true
+  openalex_journals: true
+  openreview: true
+  pwc: true
+  github: false
+  rss: false
+conferences:
+- IEEE/CVF Conference on Computer Vision and Pattern Recognition
+- IEEE/CVF International Conference on Computer Vision
+- European Conference on Computer Vision
+- Conference on Neural Information Processing Systems
+- International Conference on Learning Representations
+- International Conference on Machine Learning
+- International Conference on 3D Vision
+- IEEE International Conference on Robotics and Automation
+- IEEE/RSJ International Conference on Intelligent Robots and Systems
+- 'Robotics: Science and Systems'
+- ACM SIGGRAPH
+- ACM SIGGRAPH Asia
+journals_issn:
+- 0162-8828
+- 0920-5691
+- 1077-2626
+- 0730-0301
+- 1057-7149
+- 1520-9210
+- 0924-2716
+- 0921-8890
+rss_urls: []
+pwc_tasks:
+- point cloud denoising
+- 3d point cloud segmentation
+- scan-to-cad
+github_query:
+  q: ("point cloud" OR LiDAR) language:Python pushed:>2025-09-01
+  sort: stars
+  order: desc
+categories:
+- name: 宏量点云去噪与精简
+  highlight:
+  - denoise
+  - denoising
+  - outlier
+  - robust
+  - MLS
+  - bilateral
+  - graph
+  - sparse
+  - downsample
+  - decimation
+  - simplification
+  - voxel
+  - FPS
+  - curvature
+  - diffusion
+  - score-based
+  - normal estimation
+  arxiv_queries:
+  - ((ti:"point cloud" OR abs:"point cloud" OR abs:LiDAR) AND (abs:denoise OR abs:denoising
+    OR abs:"outlier removal" OR abs:simplification OR abs:decimation OR abs:downsampling
+    OR abs:"farthest point sampling" OR abs:"voxel grid" OR abs:curvature OR abs:"normal
+    estimation" OR abs:"score-based") AND (cat:cs.CV OR cat:cs.GR OR cat:cs.RO OR
+    cat:eess.IV))
+  # ... 其余 5 类略，同理配置
