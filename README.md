@@ -124,7 +124,7 @@ python .\paper_radar_plus.py --since_days 5
 python .\PaperRadar_UI\paper_radar_ui_qt.py
 ```
 
-* **计划与推送**：创建/删除计划任务、立即运行一次、打开日志与摘要目录
+* **计划与推送**：创建/更新计划任务、立即运行一次、打开日志与摘要目录
 * **来源与优先级**：勾选 arXiv / OpenAlex / OpenReview / RSS，设置顶会/顶刊列表、优先级和重复补齐
 * **参数**：目标篇数、每类上限、回溯天数、摘要句数、输出/缓存路径
 * **类别（YAML）**：编辑 6 大类（关键词高亮 + arXiv 查询）
