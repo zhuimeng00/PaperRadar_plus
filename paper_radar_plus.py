@@ -25,18 +25,49 @@ def load_config(path: str):
         return yaml.safe_load(f)
 
 def ensure_dir(p: pathlib.Path):
-    p.mkdir(parents=True, exist_ok=True)
+    """更稳健的建目录：如果已存在就直接返回；若是同名文件则报错；并进行一次可写性自检。"""
+    p = pathlib.Path(p)
+    try:
+        if p.exists():
+            if p.is_dir():
+                return
+            # 同名是“文件”
+            raise PermissionError(f"'{p}' 已存在但不是目录，请改 output_dir 或删除同名文件。")
+        p.mkdir(parents=True, exist_ok=True)
+    except FileExistsError:
+        # 并发情况下已被建好
+        pass
 
-def load_cache(cache_path: pathlib.Path):
-    if cache_path.exists():
+    # 可写性自检（避免 ACL/防护软件误报）
+    try:
+        testf = p / "__perm_test__.tmp"
+        with open(testf, "w", encoding="utf-8") as fh:
+            fh.write("ok")
+        testf.unlink(missing_ok=True)
+    except Exception as e:
+        raise PermissionError(
+            f"目录存在但不可写：{p}\n"
+            "可在 PowerShell（管理员）运行：\n"
+            f'  attrib -R "{p}"\n'
+            f'  cmd /c \'icacls "{p}" /grant "%USERNAME%":(OI)(CI)M /T\'\n'
+            "或把 config.yaml 里的 output_dir 改到有权限的位置（例如 %LOCALAPPDATA%\\PaperRadar\\digests）。"
+        ) from e
+
+def load_cache(cache_path) -> dict:
+    """cache_path 可为 str 或 Path；不存在则返回空结构。"""
+    p = pathlib.Path(cache_path)
+    if p.exists():
         try:
-            return json.loads(cache_path.read_text(encoding="utf-8"))
+            return json.loads(p.read_text(encoding="utf-8"))
         except Exception:
-            return {"seen": {}}
-    return {"seen": {}}
+            # 读坏了也给出最小可用结构
+            return {"seen_keys": [], "history": {}, "seen": {}}
+    return {"seen_keys": [], "history": {}, "seen": {}}
 
-def save_cache(cache, cache_path: pathlib.Path):
-    cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+def save_cache(cache: dict, cache_path) -> None:
+    p = pathlib.Path(cache_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
 
 def sanitize(s: str, n=400):
     s = re.sub(r"\s+", " ", s.strip())
@@ -117,6 +148,28 @@ def dedup_by_id(lst):
         seen.add(k); out.append(it)
     return out
 
+def _paper_key(item: dict) -> str:
+    """生成稳定的去重键：优先 id/url（去掉 arXiv 版本后缀），否则用标题归一化。"""
+    k = (item.get("id") or item.get("entry_url") or "").strip()
+    if k:
+        # 规整 arXiv 链接，去掉 vN
+        k = re.sub(r'(arxiv\.org/(abs|pdf)/\d{4}\.\d+)(v\d+)?', r'\1', k, flags=re.I)
+        return k.lower()
+    t = (item.get("title") or "").lower()
+    t = re.sub(r'\s+', ' ', t)
+    t = re.sub(r'[^a-z0-9 ]', '', t)
+    return t.strip()
+
+def dedup_by_key(items: list) -> list:
+    """同日结果去重：按 _paper_key 去重。"""
+    seen, out = set(), []
+    for it in items:
+        k = _paper_key(it)
+        if k in seen:
+            continue
+        seen.add(k); out.append(it)
+    return out
+
 # ------------------ Domain Guard & helpers ------------------
 DOMAIN_GUARD = [
     "point cloud", "lidar", "LiDAR",
@@ -180,13 +233,13 @@ def items_to_html(items):
 def items_to_text(items):
     lines = []
     for it in items:
-      title = sanitize(it.get("title",""), 260)
-      url = it.get("entry_url","")
-      date_str = (it.get("published") or "")[:10]
-      authors = ", ".join(it.get("authors",[])[:4]) + (" et al." if len(it.get("authors",[]))>4 else "")
-      venue = ", ".join(it.get("categories", [])) or it.get("src","")
-      note = f'（首次推送 {it.get("repeat_from")}）' if it.get("repeat_from") else ""
-      lines.append(f"- {title}{note}\n  {authors} · {date_str} · {venue}\n  {url}")
+        title = sanitize(it.get("title",""), 260)
+        url = it.get("entry_url","")
+        date_str = (it.get("published") or "")[:10]
+        authors = ", ".join(it.get("authors",[])[:4]) + (" et al." if len(it.get("authors",[]))>4 else "")
+        venue = ", ".join(it.get("categories", [])) or it.get("src","")
+        note = f'（首次推送 {it.get("repeat_from")}）' if it.get("repeat_from") else ""
+        lines.append(f"- {title}{note}\n  {authors} · {date_str} · {venue}\n  {url}")
     return "\n".join(lines) if lines else "（暂无条目）"
 
 def _src_counts(items):
@@ -458,6 +511,19 @@ def fetch_rss(urls, since_days, max_results=50):
             continue
     return out
 
+def dedup_groups_in_place(groups):
+    """对最终分组做一次全局去重（按 id/entry_url/title），保留首次出现的那一条。"""
+    seen = set()
+    for g in groups:
+        new_items = []
+        for it in g["items"]:
+            k = it.get("id") or it.get("entry_url") or it.get("title")
+            if not k or k in seen:
+                continue
+            seen.add(k)
+            new_items.append(it)
+        g["items"] = new_items
+
 # ------------------ Main ------------------
 def main():
     ap = argparse.ArgumentParser()
@@ -467,8 +533,15 @@ def main():
 
     cfg = load_config(args.config)
     since_days = args.since_days if args.since_days is not None else int(cfg.get("since_days", 2))
-    out_dir = pathlib.Path(cfg.get("output_dir", "./digests")); ensure_dir(out_dir)
-    cache_path = pathlib.Path(cfg.get("cache_path", "./cache.json")); cache = load_cache(cache_path)
+    # 将输出/缓存路径转为绝对路径（相对于脚本所在目录）
+    base_dir = pathlib.Path(__file__).resolve().parent
+    out_dir = pathlib.Path(cfg.get("output_dir", "./digests"))
+    cache_p = pathlib.Path(cfg.get("cache_path", "./cache.json"))
+    if not out_dir.is_absolute(): out_dir = (base_dir / out_dir).resolve()
+    if not cache_p.is_absolute(): cache_p = (base_dir / cache_p).resolve()
+
+    ensure_dir(out_dir)
+    cache_path = cache_p
     today = dt.datetime.now().date().isoformat()   # 本地日期
 
     cats_cfg = cfg.get("categories", [])
@@ -483,11 +556,11 @@ def main():
     high_pri = []
     if prefer_top:
         if toggles.get("openalex_conferences"):
-            src_map = resolve_openalex_sources(names=cfg.get("conferences", []), issns=None, cache_path="source_cache.json")
+            src_map = resolve_openalex_sources(names=cfg.get("conferences", []), issns=None, cache_path=str(base_dir / "source_cache.json"))
             conf_ids = [v for k,v in src_map.items() if str(k).startswith("name:")]
             high_pri += add_src(fetch_openalex_by_source_ids(conf_ids, since_days, work_type="proceedings-article", max_results=180), "openalex_conf")
         if toggles.get("openalex_journals"):
-            src_map = resolve_openalex_sources(names=None, issns=cfg.get("journals_issn", []), cache_path="source_cache.json")
+            src_map = resolve_openalex_sources(names=None, issns=cfg.get("journals_issn", []), cache_path=str(base_dir / "source_cache.json"))
             jour_ids = [v for k,v in src_map.items() if str(k).startswith("issn:")]
             high_pri += add_src(fetch_openalex_by_source_ids(jour_ids, since_days, work_type="journal-article", max_results=180), "openalex_journal")
         if toggles.get("openreview"):
@@ -495,7 +568,7 @@ def main():
 
     # Domain guard for non-arXiv sources
     high_pri = [it for it in high_pri if passes_domain_guard(it)]
-    high_pri = dedup_by_id(high_pri)
+    high_pri = dedup_by_key(high_pri)
 
     # arXiv bucket from per-category queries
     cfg_cats = cfg.get("categories", [])
@@ -503,40 +576,56 @@ def main():
     arxiv_bucket = []
     if toggles.get("arxiv") and queries:
         arxiv_bucket = add_src(fetch_arxiv(queries, max_results=200, since_days=since_days), "arxiv")
-    arxiv_bucket = dedup_by_id(arxiv_bucket)
+    arxiv_bucket = dedup_by_key(arxiv_bucket)
 
     # optional RSS
     rss_bucket = []
     if toggles.get("rss"):
         rss_bucket = add_src(fetch_rss(cfg.get("rss_urls", []), since_days, max_results=60), "rss")
         rss_bucket = [it for it in rss_bucket if passes_domain_guard(it)]
-        rss_bucket = dedup_by_id(rss_bucket)
+        rss_bucket = dedup_by_key(rss_bucket)
 
     # --- Selection: new items first ---
-    def is_new_item(it):
-        return it.get("id") not in cache["seen"]
+    cache = load_cache(cache_p)
+    # 兼容旧字段（可能是 list 或 dict）
+    prev_seen = set(cache.get("seen_keys") or [])
+    if isinstance(cache.get("seen"), list):
+        prev_seen.update(cache["seen"])
+    history = cache.get("history") or {}
+    if isinstance(cache.get("seen"), dict):  # 旧版本把首日日期放在 seen 映射里
+        # 合并到 history
+        for k, first_date in cache["seen"].items():
+            history.setdefault(k, first_date)
+
+    def is_new_item(it: dict) -> bool:
+        return _paper_key(it) not in prev_seen
 
     high_pri_new = [it for it in high_pri if is_new_item(it)]
     arxiv_new = [it for it in arxiv_bucket if is_new_item(it)]
 
-    def fill_from(items, groups, cats_cfg, cfg):
+    def fill_from(items, groups, cats_cfg, cfg, selected_keys: set):
+        """从候选集中按打分分配到分组；selected_keys 为全局已选 key，用来避免重复。"""
         per_max = int(cfg.get("per_category_max", 3))
         target_total = int(cfg.get("target_total", 5))
-        picked=[]
+        picked = []
         for it in items:
+            k = _paper_key(it)
+            if not k or k in selected_keys:
+                continue
             gi, sc = assign_best_category(it, cats_cfg)
-            it["_score"]=sc
-            # respect per-category and global caps
+            it["_score"] = sc
             if len(groups[gi]["items"]) < per_max and sum(len(g["items"]) for g in groups) < target_total:
                 groups[gi]["items"].append(it)
+                selected_keys.add(k)      # ← 关键：记录已选 key
                 picked.append(it)
         return picked
 
     # 1) top venues (new)
-    picked_high = fill_from(high_pri_new, groups, cats_cfg, cfg)
+    selected_keys = set()
+    picked_high = fill_from(high_pri_new, groups, cats_cfg, cfg, selected_keys)
     # 2) arXiv (new)
     if sum(len(g["items"]) for g in groups) < int(cfg.get("min_daily", 0) or cfg.get("target_total",5)):
-        picked_arxiv = fill_from(arxiv_new, groups, cats_cfg, cfg)
+        picked_arxiv = fill_from(arxiv_new, groups, cats_cfg, cfg, selected_keys)
 
     # 3) fallback: backfill with older NEW items (top venues first, then arXiv)
     need_more = sum(len(g["items"]) for g in groups) < int(cfg.get("min_daily",0) or cfg.get("target_total",5))
@@ -552,13 +641,13 @@ def main():
             src_map_fb = resolve_openalex_sources(names=None, issns=cfg.get("journals_issn", []), cache_path="source_cache.json")
             jour_ids_fb = [v for k,v in src_map_fb.items() if str(k).startswith("issn:")]
             pool_high += add_src(fetch_openalex_by_source_ids(jour_ids_fb, fb_days, work_type="journal-article", max_results=200), "openalex_journal")
-        pool_high = [it for it in dedup_by_id(pool_high) if is_new_item(it) and passes_domain_guard(it)]
-        fill_from(pool_high, groups, cats_cfg, cfg)
+        pool_high = [it for it in dedup_by_key(pool_high) if is_new_item(it) and passes_domain_guard(it)]
+        fill_from(pool_high, groups, cats_cfg, cfg, selected_keys)
 
         # arXiv fallback
         if toggles.get("arxiv") and queries:
-            pool_arxiv = [it for it in dedup_by_id(fetch_arxiv(queries, max_results=200, since_days=fb_days)) if is_new_item(it)]
-            fill_from(pool_arxiv, groups, cats_cfg, cfg)
+            pool_arxiv = [it for it in dedup_by_key(fetch_arxiv(queries, max_results=200, since_days=fb_days)) if is_new_item(it)]
+            fill_from(pool_arxiv, groups, cats_cfg, cfg, selected_keys)
 
     # 4) repeat fill (within lookback) if still not enough
     picked_repeat = []
@@ -567,18 +656,18 @@ def main():
         lookback = int(prio_cfg.get("repeat_lookback_days", 7))
         cutoff = (dt.datetime.utcnow().date() - dt.timedelta(days=lookback)).isoformat()
         # build universe of candidates
-        universe = dedup_by_id(high_pri + arxiv_bucket + rss_bucket)
-        todays_ids = {it["id"] for g in groups for it in g["items"]}
-        repeat_pool = []
+        universe = dedup_by_key(high_pri + arxiv_bucket + rss_bucket)
         # history ids & first-seen dates
-        history_ids = {pid: d for pid, d in cache.get("seen", {}).items() if d >= cutoff}
+        history_keys = {k: d for k, d in history.items() if d >= cutoff}
+        todays_keys = {_paper_key(it) for g in groups for it in g["items"]}
 
+        repeat_pool = []
         for it in universe:
-            pid = it.get("id")
-            if not pid or pid in todays_ids: 
+            k = _paper_key(it)
+            if not k or k in todays_keys:
                 continue
-            if pid in history_ids:
-                it["repeat_from"] = history_ids[pid]
+            if k in history_keys:
+                it["repeat_from"] = history_keys[k]
                 repeat_pool.append(it)
 
         # score & fill
@@ -597,9 +686,14 @@ def main():
                 picked_repeat.append(it)
 
     # --- Finalize & Output ---
+    dedup_groups_in_place(groups)
     # write digest
     md = as_markdown(today, groups, cfg)
-    ensure_dir(out_dir := pathlib.Path(cfg.get("output_dir","./digests")))
+    proj_root = pathlib.Path(__file__).resolve().parent
+    out_dir = pathlib.Path(cfg.get("output_dir", "./digests"))
+    if not out_dir.is_absolute():
+        out_dir = (proj_root / out_dir).resolve()
+    ensure_dir(out_dir)
     outfile = out_dir / f"{today}.md"
     outfile.write_text(md, encoding="utf-8")
 
@@ -608,14 +702,20 @@ def main():
     ok, msg = send_digest_email(cfg, today, final_picks, str(outfile))
     print("Email:", msg)
 
-    # update cache only for final picks
-    final_picks = [it for g in groups for it in g["items"]]
-    new_count = sum(1 for it in final_picks if cache["seen"].get(it["id"]) is None)
+    # --- 统计（基于运行开始时的 prev_seen） ---
+    new_count = sum(1 for it in final_picks if _paper_key(it) not in prev_seen)
     repeat_count = sum(1 for it in final_picks if it.get("repeat_from"))
+
+    # --- 写回缓存：先更新 seen_keys，再补 history 的首次日期 ---
     for it in final_picks:
-        if it["id"] not in cache["seen"]:
-            cache["seen"][it["id"]] = today
-    save_cache(cache, cache_path)
+        k = _paper_key(it)
+        prev_seen.add(k)
+        history.setdefault(k, today)
+
+    cache["seen_keys"] = sorted(prev_seen)
+    cache["history"]   = history
+    cache["seen"]      = history     # ← 兼容旧版本使用 seen 字段
+    save_cache(cache, cache_p)
 
     picked_total = len(final_picks)
     print(f"{today}: 新论文 {new_count} 篇，入选 {picked_total} 篇（其中重复补齐 {repeat_count} 篇）")

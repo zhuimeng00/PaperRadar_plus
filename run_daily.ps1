@@ -1,95 +1,80 @@
-# PaperRadar daily runner (UTF-8 logging; WinPS 5.1 compatible)
+# PaperRadar daily runner · UTF-8 (no BOM) log + fixed working dir
 param(
-  [int]$SinceDays = 2,
+  [int]$SinceDays = 5,
   [switch]$OpenDigest = $true
 )
 
 $ErrorActionPreference = "Stop"
 
-# --- Project & Python ---
-$ProjectDir = $PSScriptRoot
+# --- Paths ---
+$ProjectDir = "D:\PaperRader\PaperRadar_plus"   # ← 如路径变化请改这里
 if (-not (Test-Path $ProjectDir)) { throw "Project directory not found: $ProjectDir" }
-Set-Location $ProjectDir
 
 $Py = Join-Path $ProjectDir ".venv\Scripts\python.exe"
 if (-not (Test-Path $Py)) {
   if (Get-Command py.exe -ErrorAction SilentlyContinue)      { $Py = "py.exe" }
   elseif (Get-Command python.exe -ErrorAction SilentlyContinue) { $Py = "python.exe" }
-  else { throw "Python not found. Create venv and install deps first." }
+  else { throw "Python not found. Create venv first." }
 }
 
-# --- Log (force UTF-8; ensure BOM so VS Code/Notepad auto-detect) ---
+$Config = Join-Path $ProjectDir "config.yaml"   # 绝对路径传给 python
+$DigestDir = Join-Path $ProjectDir "digests"
+
+# --- Log (UTF-8 no BOM, append) ---
 $LogDir = Join-Path $ProjectDir "logs"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $today = Get-Date -Format "yyyy-MM-dd"
 $LogFile = Join-Path $LogDir ("run_" + $today + ".log")
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+$sw = New-Object System.IO.StreamWriter($LogFile, $true, $utf8)
 
-# 先写一个 UTF-8（带 BOM）的头行，后续都以 UTF-8 追加
-$CmdShow = "PaperRadar --run --since_days $SinceDays"
-$now = Get-Date
-$Header = "[{0:yyyy-MM-dd HH:mm:ss}{1}] RUN: {2}" -f $now, $now.ToString("zzz"), $CmdShow
-if (Test-Path $LogFile) {
-  # 已有当日日志：空一行后追加抬头（UTF-8）
-  "`r`n$Header" | Add-Content -Path $LogFile -Encoding utf8
-} else {
-  # 首次生成当天日志：创建 UTF-8（带 BOM）文件
-  $Header | Out-File -FilePath $LogFile -Encoding utf8
+function Write-Log([string]$line) {
+  $sw.WriteLine($line); $sw.Flush()
 }
-Write-Host $Header
 
-# 控制台输出也切到 UTF-8
-$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-$OutputEncoding = $utf8NoBom
-[Console]::OutputEncoding = $utf8NoBom
+# 头部（本地时区）
+$cmdShow = "PaperRadar --run --config `"$Config`" --since_days $SinceDays"
+$header  = "[{0:yyyy-MM-dd HH:mm:ssK}] RUN: {1}" -f (Get-Date), $cmdShow
+Write-Host $header
+Write-Log  $header
 
-# --- Run python (WinPS 5.1 用 Arguments；强制子进程走 UTF-8) ---
+# --- Spawn python with fixed WorkingDirectory ---
 $psi = New-Object System.Diagnostics.ProcessStartInfo
-$psi.FileName               = $Py
-$psi.Arguments              = "`"$ProjectDir\paper_radar_plus.py`" --since_days $SinceDays"
+$psi.FileName = $Py
+$psi.WorkingDirectory = $ProjectDir         # ← 关键：修正子进程 CWD
+$psi.Arguments = "`"$ProjectDir\paper_radar_plus.py`" --config `"$Config`" --since_days $SinceDays"
 $psi.RedirectStandardOutput = $true
 $psi.RedirectStandardError  = $true
-$psi.UseShellExecute        = $false
-$psi.CreateNoWindow         = $true
-
-# 让 .NET 以 UTF-8 解码子进程输出
-$psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
-$psi.StandardErrorEncoding  = [System.Text.Encoding]::UTF8
-# 让 Python 强制 UTF-8 输出
-$psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"
-$psi.EnvironmentVariables["PYTHONUTF8"]       = "1"
+$psi.UseShellExecute = $false
+$psi.CreateNoWindow = $true
 
 $proc = New-Object System.Diagnostics.Process
 $proc.StartInfo = $psi
 $null = $proc.Start()
 
-# 交替读取 stdout/stderr，手动 tee 到控制台 + UTF-8 日志（追加）
-$stdOut = $proc.StandardOutput
-$stdErr = $proc.StandardError
-while(-not $proc.HasExited -or -not $stdOut.EndOfStream -or -not $stdErr.EndOfStream) {
-  if(-not $stdOut.EndOfStream) {
-    $line = $stdOut.ReadLine()
-    if($null -ne $line) { Write-Host $line; $line | Out-File -FilePath $LogFile -Append -Encoding utf8 }
-  }
-  if(-not $stdErr.EndOfStream) {
-    $eline = $stdErr.ReadLine()
-    if($null -ne $eline) { Write-Host $eline; $eline | Out-File -FilePath $LogFile -Append -Encoding utf8 }
-  }
+$stdout = $proc.StandardOutput
+$stderr = $proc.StandardError
+
+while(-not $proc.HasExited -or -not $stdout.EndOfStream -or -not $stderr.EndOfStream){
+  if(-not $stdout.EndOfStream){ $l = $stdout.ReadLine(); if($null -ne $l){ Write-Host $l; Write-Log $l } }
+  if(-not $stderr.EndOfStream){ $e = $stderr.ReadLine(); if($null -ne $e){ Write-Host $e; Write-Log $e } }
   Start-Sleep -Milliseconds 10
 }
-$ExitCode = $proc.ExitCode
+$exit = $proc.ExitCode
 
-# --- Summary / popup / open digest ---
-$digest = Join-Path (Join-Path $ProjectDir "digests") ($today + ".md")
-if (Test-Path $digest) { $msg = "Digest generated: " + $digest } else { $msg = "No digest. See log: " + $LogFile }
-try { $wshell = New-Object -ComObject Wscript.Shell; $wshell.Popup($msg, 8, "PaperRadar", 64) | Out-Null } catch {}
+# --- Popup / open digest ---
+$digest = Join-Path $DigestDir ($today + ".md")
+$msg = if (Test-Path $digest) { "Digest generated: $digest" } else { "No digest. See log: $LogFile" }
+try { (New-Object -ComObject Wscript.Shell).Popup($msg, 8, "PaperRadar", 64) | Out-Null } catch {}
 
 if ($OpenDigest -and (Test-Path $digest)) {
   try {
-    if (Get-Command code -ErrorAction SilentlyContinue)      { & code --reuse-window "$digest" }
+    if (Get-Command code -ErrorAction SilentlyContinue) { & code --reuse-window "$digest" }
     elseif (Get-Command typora.exe -ErrorAction SilentlyContinue) { & typora.exe "$digest" }
-    elseif (Get-Command notepad.exe -ErrorAction SilentlyContinue){ & notepad.exe "$digest" }
+    elseif (Get-Command notepad.exe -ErrorAction SilentlyContinue) { & notepad.exe "$digest" }
     else { Invoke-Item "$digest" }
   } catch {}
 }
 
-exit $ExitCode
+$sw.Dispose()
+exit $exit
